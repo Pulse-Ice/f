@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Builds the spotifyglass tweak and injects it (plus FLEX) into a decrypted Spotify IPA.
 #
-#   scripts/pipeline.sh <decrypted.ipa> [-o out.ipa] [--no-flex] [--no-safari] [--no-downloads] [--install] [--name N] [--icon P.png]   (or: make build / make install)
+#   scripts/pipeline.sh <decrypted.ipa> [-o out.ipa] [--no-flex] [--no-safari] [--no-downloads] [--livecontainer] [--install] [--name N] [--icon P.png]   (or: make build / make install / make livecontainer)
 #
 # --install hands the result to install.sh (sign with your certificate, push to the plugged-in iPhone).
 #
 # The IPA is yours to supply: drop a decrypted Spotify .ipa in ipa/ and the Makefile finds it.
+# --livecontainer builds for LiveContainer (import the IPA into LiveContainer, not a real install):
+# the tweak alone, without the app extensions and widget/shim repackaging LiveContainer cannot run.
 #
 # Needs: Theos in $THEOS (default ~/theos), an iPhoneOS 26+ SDK from the selected Xcode or in $THEOS/sdks,
 # gmake, ldid, dpkg-deb (brew) and cyan (uv tool install "cyan @ git+https://github.com/asdfzxcvbn/pyzule-rw").
@@ -24,7 +26,7 @@ FLEX_DEB="$ROOT/vendor/com.hopeless.autoflex_0.0.1_iphoneos-arm.deb"
 BUNDLE_ID="${BUNDLE_ID:-}"
 mkdir -p "$ROOT/out"
 
-IN="" OUT="" WITH_FLEX=1 WITH_SAFARI=1 WITH_DOWNLOADS=1 INSTALL=0 NAME="" ICON=""
+IN="" OUT="" WITH_FLEX=1 WITH_SAFARI=1 WITH_DOWNLOADS=1 WITH_LIVE=0 INSTALL=0 NAME="" ICON=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) OUT="$2"; shift 2 ;;
@@ -33,6 +35,7 @@ while [ $# -gt 0 ]; do
     --no-flex) WITH_FLEX=0; shift ;;
     --no-safari) WITH_SAFARI=0; shift ;;
     --no-downloads) WITH_DOWNLOADS=0; shift ;;
+    --livecontainer) WITH_LIVE=1; shift ;;
     --install) INSTALL=1; shift ;;
     -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) IN="$1"; shift ;;
@@ -40,6 +43,13 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$IN" ] || { echo "no IPA: put a decrypted Spotify .ipa in ipa/, or pass one (make build IPA=path.ipa)" >&2; exit 1; }
 [ -f "$IN" ] || { echo "no such file: $IN" >&2; exit 1; }
+# LiveContainer runs the app as a guest: app extensions (.appex) never load there, and the
+# App Group shim / widget patch / icon + intents repackaging only make sense for a real
+# install (Feather, TrollStore, ...). A LiveContainer build is the tweak alone.
+if [ "$WITH_LIVE" = 1 ]; then
+  WITH_SAFARI=0
+  echo "==> LiveContainer mode: tweak only, no extensions, no App Group shim"
+fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing $1 -> $2" >&2; exit 1; }; }
 need gmake "brew install make"
@@ -112,7 +122,9 @@ FILES=("$TWEAK_DEB")
 [ "$WITH_FLEX" = 1 ] && FILES+=("$FLEX_DEB")
 
 # The Live Activity (Shared/LiveActivity) draws in a widget extension of its own.
-if xcrun --sdk iphoneos --find swiftc >/dev/null 2>&1; then
+if [ "$WITH_LIVE" = 1 ]; then
+  echo "==> skipping the Live Activity extension (unsupported in LiveContainer)"
+elif xcrun --sdk iphoneos --find swiftc >/dev/null 2>&1; then
   EXT_DIR="$ROOT/out/extension"
   unzip -p "$IN" "${APP_DIR}Info.plist" > "$ROOT/out/.info.plist"
   bash "$ROOT/scripts/build-extension.sh" "$ROOT/out/.info.plist" "$EXT_DIR"
@@ -135,11 +147,15 @@ fi
 
 # Spotify's widget reads what the app writes through App Group suites the re-signed IPA is not entitled
 # to; this dylib, loaded by the app and by the widget, puts both on a group the signature does have.
-echo "==> building the App Group shim"
-GROUPS_DYLIB="$ROOT/out/SpotifyGlassAppGroups.dylib"
-xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -dynamiclib -fobjc-arc -Os -framework Foundation -framework Security \
-  -install_name @rpath/SpotifyGlassAppGroups.dylib -o "$GROUPS_DYLIB" "$ROOT/extension/AppGroups/AppGroups.m"
-FILES+=("$GROUPS_DYLIB")
+if [ "$WITH_LIVE" = 1 ]; then
+  echo "==> skipping the App Group shim (no widget in LiveContainer)"
+else
+  echo "==> building the App Group shim"
+  GROUPS_DYLIB="$ROOT/out/SpotifyGlassAppGroups.dylib"
+  xcrun --sdk iphoneos clang -target arm64-apple-ios16.0 -dynamiclib -fobjc-arc -Os -framework Foundation -framework Security \
+    -install_name @rpath/SpotifyGlassAppGroups.dylib -o "$GROUPS_DYLIB" "$ROOT/extension/AppGroups/AppGroups.m"
+  FILES+=("$GROUPS_DYLIB")
+fi
 
 echo "==> injecting"
 # -w drops the Watch app: its companion-app key would still name com.spotify.client and block the install.
@@ -150,25 +166,29 @@ rm -f "$ROOT/out/.info.plist"
 cyan -i "$IN" -o "$OUT" -f "${FILES[@]}" -l "$ROOT/out/.injection.plist" ${BUNDLE_ID:+-b "$BUNDLE_ID"} ${NAME:+-n "$NAME"} ${ICON:+-k "$ICON"} -w -s --overwrite
 rm -f "$ROOT/out/.injection.plist"
 
-echo "==> loading the App Group shim in the home screen widget"
-WIDGET_BIN="${APP_DIR}PlugIns/WidgetExtension.appex/WidgetExtension"
-if unzip -l "$OUT" "$WIDGET_BIN" >/dev/null 2>&1; then
-  PATCH="$(mktemp -d)"
-  unzip -q "$OUT" "$WIDGET_BIN" -d "$PATCH"
-  python3 "$ROOT/scripts/insert-dylib.py" "$PATCH/$WIDGET_BIN" @rpath/SpotifyGlassAppGroups.dylib
-  # Fakesigned again with its own entitlements, the way cyan -s left it, for TrollStore.
-  ldid -e "$PATCH/$WIDGET_BIN" > "$PATCH/ents.plist"
-  ldid -S"$PATCH/ents.plist" "$PATCH/$WIDGET_BIN"
-  OUT_ABS="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
-  (cd "$PATCH" && zip -q "$OUT_ABS" "$WIDGET_BIN")
-  rm -rf "$PATCH"
+if [ "$WITH_LIVE" = 1 ]; then
+  echo "==> skipping the widget patch and alternate icons (unsupported in LiveContainer)"
 else
-  echo "    no WidgetExtension.appex in this IPA"
-fi
+  echo "==> loading the App Group shim in the home screen widget"
+  WIDGET_BIN="${APP_DIR}PlugIns/WidgetExtension.appex/WidgetExtension"
+  if unzip -l "$OUT" "$WIDGET_BIN" >/dev/null 2>&1; then
+    PATCH="$(mktemp -d)"
+    unzip -q "$OUT" "$WIDGET_BIN" -d "$PATCH"
+    python3 "$ROOT/scripts/insert-dylib.py" "$PATCH/$WIDGET_BIN" @rpath/SpotifyGlassAppGroups.dylib
+    # Fakesigned again with its own entitlements, the way cyan -s left it, for TrollStore.
+    ldid -e "$PATCH/$WIDGET_BIN" > "$PATCH/ents.plist"
+    ldid -S"$PATCH/ents.plist" "$PATCH/$WIDGET_BIN"
+    OUT_ABS="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
+    (cd "$PATCH" && zip -q "$OUT_ABS" "$WIDGET_BIN")
+    rm -rf "$PATCH"
+  else
+    echo "    no WidgetExtension.appex in this IPA"
+  fi
 
-echo "==> adding the alternate app icons"
-# A failure leaves the IPA as it was, without them; Mod > App icon then does not show.
-bash "$ROOT/scripts/app-icons.sh" "$OUT" || echo "    the app icons failed: building without them"
+  echo "==> adding the alternate app icons"
+  # A failure leaves the IPA as it was, without them; Mod > App icon then does not show.
+  bash "$ROOT/scripts/app-icons.sh" "$OUT" || echo "    the app icons failed: building without them"
+fi
 
 if [ -n "${EXT_DIR:-}" ]; then
   echo "==> adding the Live Activity intents to Spotify's App Intents metadata"
