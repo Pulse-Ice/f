@@ -16,11 +16,13 @@ FLEX_ARG := $(if $(filter 0,$(FLEX)),--no-flex,)
 DEV_NAME ?= Taurus.dev
 DEV_ICON ?= docs/icon.png
 
-.PHONY: build release install trees session log flags
+.PHONY: build release livecontainer install trees session log flags
 build:    ## FLEX + glass IPA into out/
 	bash ./scripts/pipeline.sh $(IPA) $(SAFARI_ARG)
 release:  ## glass only, no FLEX
 	bash ./scripts/pipeline.sh $(IPA) $(SAFARI_ARG) --no-flex
+livecontainer:  ## tweak-only IPA for LiveContainer (import into LiveContainer, not a real install)
+	bash ./scripts/pipeline.sh $(IPA) --livecontainer --no-flex --no-downloads -o out/Taurus.livecontainer.ipa
 install:  ## build, sign with your certificate, push to the phone on USB (FLEX=1 to take FLEX too)
 	bash ./scripts/pipeline.sh $(IPA) $(SAFARI_ARG) --install $(FLEX_ARG) --name "$(DEV_NAME)" --icon "$(DEV_ICON)" -o out/Taurus.dev.ipa
 trees:    ## record per-screen view trees into trees/ (needs a FLEX build on the phone)
