@@ -5,13 +5,25 @@
 #import <stdint.h>
 #import "SGFillClip.h"
 
-// Never block forever on AVFoundation's completion handler: a cancelled write
-// would otherwise freeze the caller (the app, if this ever runs on main).
-static BOOL SGWaitTimeout(dispatch_semaphore_t sem, NSTimeInterval seconds) {
-    return dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC))) == 0;
-}
+// Fill is EeveeImmersive's layered treatment in the 3:4 clip the lock screen fills the screen with:
+// the sharp cover edge to edge from the top of the frame, four Gaussian-blurred copies ramping in one
+// after another below the fade zone (a progressive blur, only below the artwork, never above it), the
+// whole stack dissolving into a dark tint sampled from the cover's bottom edge. A taller phone screen
+// cuts such a clip's sides off, so the sharp cover reads full-bleed the way the system's own artwork
+// does: crisp edge to edge and cropped, never a centered square floating between blur bars.
 
-static const CGFloat kBackdropBlurRadius = 22.0, kEdgeFade = 0.035;
+// The artwork stays fully crisp above this share of the frame's height, and has fully dissolved into
+// the background by this share. Each blur level ramps in over its own band, the lowest bands blurring
+// the most. Shares of the frame height, from the top; EeveeImmersive's own tuning.
+static const CGFloat kFadeStart = 0.76, kFadeEnd = 0.985;
+static const CGFloat kBand[4][2] = {
+    {0.74, 0.84}, {0.79, 0.89}, {0.84, 0.94}, {0.89, 0.985}
+};
+// The blur radii at 640 px across, scaled with the frame. The layers are drawn small and scaled up,
+// since they hold no detail, so these read as output pixels.
+static const CGFloat kRadius[4] = {2.5, 6.0, 12.0, 22.0};
+static const CGFloat kBlurAcross = 192.0;
+// A still is one frame held this long; the loop the lock screen plays is this many frames.
 static const int32_t kLoopSeconds = 4, kFramesPerSecond = 24;
 
 static CGColorSpaceRef fillColorSpace(void) {
@@ -48,7 +60,7 @@ static UIColor *fillBackgroundColor(CGImageRef cover) {
     size_t width = CGImageGetWidth(cover), height = CGImageGetHeight(cover);
     if (width < 8 || height < 8) return UIColor.blackColor;
     CGRect sampleRect = CGRectMake(floor(width * 0.13), floor(height * 0.92),
-                                   floor(width * 0.74), height - floor(height * 0.92));
+                                    floor(width * 0.74), height - floor(height * 0.92));
     CGImageRef sample = CGImageCreateWithImageInRect(cover, sampleRect);
     if (!sample) return UIColor.blackColor;
 
@@ -82,21 +94,6 @@ static UIColor *fillBackgroundColor(CGImageRef cover) {
     return [UIColor colorWithHue:hue saturation:saturation brightness:brightness alpha:1];
 }
 
-static CGImageRef blurredCoverForFrame(CGImageRef cover, CGFloat radius, CGSize size) CF_RETURNS_RETAINED {
-    CIImage *input = [CIImage imageWithCGImage:cover];
-    CGRect extent = input.extent;
-    CGFloat side = MIN(extent.size.width, extent.size.height);
-    CGRect square = CGRectMake(CGRectGetMidX(extent) - side / 2, CGRectGetMidY(extent) - side / 2, side, side);
-    CIImage *artwork = [input imageByCroppingToRect:square];
-    CGRect artworkExtent = artwork.extent;
-    CGFloat frameHeight = artworkExtent.size.width * size.height / size.width;
-    CGRect outputRect = CGRectMake(artworkExtent.origin.x,
-                                   CGRectGetMidY(artworkExtent) - frameHeight / 2,
-                                   artworkExtent.size.width, frameHeight);
-    CIImage *output = [[artwork imageByClampingToExtent] imageByApplyingGaussianBlurWithSigma:radius];
-    return [fillCIContext() createCGImage:output fromRect:outputRect];
-}
-
 static void drawFilling(CGContextRef context, CGImageRef image, CGRect rect) {
     CGFloat imageWidth = CGImageGetWidth(image), imageHeight = CGImageGetHeight(image);
     if (imageWidth <= 0 || imageHeight <= 0) return;
@@ -109,95 +106,122 @@ static void drawFilling(CGContextRef context, CGImageRef image, CGRect rect) {
     CGContextDrawImage(context, destination, image);
 }
 
-static CGImageRef fullFrameLayer(CGImageRef image, CGSize size) CF_RETURNS_RETAINED {
-    CGContextRef context = bitmapContext(size);
+// The cover aspect-filled into `size`, blurred by `baseRadius` (one of kRadius, quoted at 640 px
+// across). Blurred small and drawn large: a blur this wide looks the same either way, and on the CPU
+// at full size the four levels took seconds per track.
+static CGImageRef blurredLayer(CGImageRef cover, CGFloat baseRadius, CGSize size) CF_RETURNS_RETAINED {
+    CGFloat across = MIN(kBlurAcross, size.width);
+    CGSize small = CGSizeMake(across, MAX(1, round(across * size.height / MAX(size.width, 1))));
+    CGFloat sigma = MAX(baseRadius * small.width / 640.0, 0.5);
+    CGContextRef context = bitmapContext(small);
     if (!context) return NULL;
-    CGContextTranslateCTM(context, 0, size.height);
+    CGContextTranslateCTM(context, 0, small.height);
     CGContextScaleCTM(context, 1, -1);
-    drawFilling(context, image, CGRectMake(0, 0, size.width, size.height));
-    CGImageRef result = CGBitmapContextCreateImage(context);
+    drawFilling(context, cover, CGRectMake(0, 0, small.width, small.height));
+    CGImageRef unblurred = CGBitmapContextCreateImage(context);
     CGContextRelease(context);
-    return result;
+    if (!unblurred) return NULL;
+    CIImage *input = [CIImage imageWithCGImage:unblurred];
+    CGImageRelease(unblurred);
+    CIImage *output = [[[input imageByClampingToExtent] imageByApplyingGaussianBlurWithSigma:sigma]
+        imageByCroppingToRect:input.extent];
+    CGImageRef blurred = [fillCIContext() createCGImage:output fromRect:input.extent];
+    if (!blurred) return NULL;
+    CGContextRef full = bitmapContext(size);
+    if (!full) {
+        CGImageRelease(blurred);
+        return NULL;
+    }
+    CGContextTranslateCTM(full, 0, size.height);
+    CGContextScaleCTM(full, 1, -1);
+    CGContextSetInterpolationQuality(full, kCGInterpolationHigh);
+    CGContextDrawImage(full, CGRectMake(0, 0, size.width, size.height), blurred);
+    CGImageRelease(blurred);
+    CGImageRef framed = CGBitmapContextCreateImage(full);
+    CGContextRelease(full);
+    return framed;
 }
 
-static void addRampStop(CGFloat *components, CGFloat *locations, NSUInteger *count, CGFloat location, CGFloat alpha) {
-    locations[*count] = location;
-    components[*count * 4] = 1;
-    components[*count * 4 + 1] = 1;
-    components[*count * 4 + 2] = 1;
-    components[*count * 4 + 3] = alpha;
-    (*count)++;
-}
-
-static CGGradientRef alphaRamp(CGFloat start, CGFloat end, BOOL rising) {
+// A smoothstep alpha ramp over the whole 0..1 of the gradient it is drawn with: 0 to 1 when rising,
+// 1 to 0 otherwise. The stops must span the band the gradient is drawn across exactly; baking the
+// band into the stops the way the old edge fade did compresses the ramp into a sliver of it.
+static CGGradientRef smoothRamp(BOOL rising) {
     enum { kSteps = 14 };
-    CGFloat components[(kSteps + 3) * 4], locations[kSteps + 3];
-    NSUInteger count = 0;
-    addRampStop(components, locations, &count, 0, rising ? 0 : 1);
-    for (NSUInteger index = 0; index <= kSteps; index++) {
+    CGFloat components[(kSteps + 1) * 4], locations[kSteps + 1];
+    for (NSUInteger index = 0; index <= (NSUInteger)kSteps; index++) {
         CGFloat progress = (CGFloat)index / kSteps;
         CGFloat smooth = progress * progress * (3 - 2 * progress);
-        addRampStop(components, locations, &count, start + (end - start) * progress, rising ? smooth : 1 - smooth);
+        locations[index] = progress;
+        CGFloat alpha = rising ? smooth : 1 - smooth;
+        components[index * 4] = 1;
+        components[index * 4 + 1] = 1;
+        components[index * 4 + 2] = 1;
+        components[index * 4 + 3] = alpha;
     }
-    addRampStop(components, locations, &count, 1, rising ? 1 : 0);
-    return CGGradientCreateWithColorComponents(fillColorSpace(), components, locations, count);
+    return CGGradientCreateWithColorComponents(fillColorSpace(), components, locations, kSteps + 1);
 }
 
-static void applyRamp(CGContextRef context, CGFloat originY, CGFloat height, CGFloat start, CGFloat end, BOOL rising) {
-    CGGradientRef gradient = alphaRamp(start, end, rising);
+// Fades `context`'s alpha across the band at `top` of `height`, in the flipped (y-down) space the
+// art is drawn in: `top` is the band's upper edge on screen.
+static void applyBand(CGContextRef context, CGFloat top, CGFloat height, BOOL rising) {
+    if (height <= 0) return;
+    CGGradientRef gradient = smoothRamp(rising);
     if (!gradient) return;
     CGContextSaveGState(context);
     CGContextSetBlendMode(context, kCGBlendModeDestinationIn);
-    CGContextDrawLinearGradient(context, gradient, CGPointMake(0, originY + start * height), CGPointMake(0, originY + end * height),
-                                kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
+    CGContextDrawLinearGradient(context, gradient, CGPointMake(0, top), CGPointMake(0, top + height), 0);
     CGContextRestoreGState(context);
     CGGradientRelease(gradient);
 }
 
-static CGImageRef maskedLayer(CGImageRef image, CGSize size, CGRect artworkRect) CF_RETURNS_RETAINED {
-    CGContextRef context = bitmapContext(size);
-    if (!context) return NULL;
-    CGContextTranslateCTM(context, 0, size.height);
-    CGContextScaleCTM(context, 1, -1);
-    CGContextClipToRect(context, artworkRect);
-    drawFilling(context, image, artworkRect);
-    applyRamp(context, artworkRect.origin.y, artworkRect.size.height, 0, kEdgeFade, YES);
-    applyRamp(context, artworkRect.origin.y, artworkRect.size.height, 1 - kEdgeFade, 1, NO);
-    CGImageRef result = CGBitmapContextCreateImage(context);
-    CGContextRelease(context);
-    return result;
-}
-
 CGImageRef SGFillClipFrame(CGImageRef cover, CGSize size) {
     if (!cover || size.width < 1 || size.height < 1) return NULL;
-    CGFloat side = MIN(size.width, size.height);
-    CGRect artworkRect = CGRectMake((size.width - side) / 2, (size.height - side) / 2, side, side);
-    CGFloat blurScale = MAX(1.0, (CGFloat)CGImageGetWidth(cover) / 640.0);
 
-    CGImageRef backdropBlur = blurredCoverForFrame(cover, kBackdropBlurRadius * blurScale, size);
-    CGImageRef backdrop = backdropBlur ? fullFrameLayer(backdropBlur, size) : NULL;
-    if (backdropBlur) CGImageRelease(backdropBlur);
-    CGImageRef foreground = maskedLayer(cover, size, artworkRect);
-    if (!backdrop || !foreground) {
-        if (backdrop) CGImageRelease(backdrop);
-        if (foreground) CGImageRelease(foreground);
-        return NULL;
+    // The art stack: the sharp cover filling the frame, the four blurs ramping in below it, then
+    // the whole stack fading out toward the bottom.
+    CGContextRef art = bitmapContext(size);
+    if (!art) return NULL;
+    CGContextTranslateCTM(art, 0, size.height);
+    CGContextScaleCTM(art, 1, -1);
+    drawFilling(art, cover, CGRectMake(0, 0, size.width, size.height));
+    for (int level = 0; level < 4; level++) {
+        CGImageRef blurred = blurredLayer(cover, kRadius[level], size);
+        if (!blurred) continue;
+        CGContextRef layer = bitmapContext(size);
+        if (!layer) {
+            CGImageRelease(blurred);
+            continue;
+        }
+        CGContextTranslateCTM(layer, 0, size.height);
+        CGContextScaleCTM(layer, 1, -1);
+        CGContextDrawImage(layer, CGRectMake(0, 0, size.width, size.height), blurred);
+        CGImageRelease(blurred);
+        applyBand(layer, kBand[level][0] * size.height,
+                  (kBand[level][1] - kBand[level][0]) * size.height, YES);
+        CGImageRef masked = CGBitmapContextCreateImage(layer);
+        CGContextRelease(layer);
+        if (masked) {
+            CGContextDrawImage(art, CGRectMake(0, 0, size.width, size.height), masked);
+            CGImageRelease(masked);
+        }
     }
+    applyBand(art, kFadeStart * size.height, (kFadeEnd - kFadeStart) * size.height, NO);
+    CGImageRef stack = CGBitmapContextCreateImage(art);
+    CGContextRelease(art);
+    if (!stack) return NULL;
 
     CGContextRef context = bitmapContext(size);
     if (!context) {
-        CGImageRelease(backdrop);
-        CGImageRelease(foreground);
+        CGImageRelease(stack);
         return NULL;
     }
     CGContextSetFillColorWithColor(context, fillBackgroundColor(cover).CGColor);
     CGContextFillRect(context, CGRectMake(0, 0, size.width, size.height));
     CGContextTranslateCTM(context, 0, size.height);
     CGContextScaleCTM(context, 1, -1);
-    CGContextDrawImage(context, CGRectMake(0, 0, size.width, size.height), backdrop);
-    CGImageRelease(backdrop);
-    CGContextDrawImage(context, CGRectMake(0, 0, size.width, size.height), foreground);
-    CGImageRelease(foreground);
+    CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
+    CGContextDrawImage(context, CGRectMake(0, 0, size.width, size.height), stack);
+    CGImageRelease(stack);
     CGImageRef result = CGBitmapContextCreateImage(context);
     CGContextRelease(context);
     return result;
@@ -269,7 +293,8 @@ BOOL SGFillClipWriteFrame(NSURL *file, CGImageRef frame, CGSize size) {
     [writer endSessionAtSourceTime:CMTimeMake(kLoopSeconds, 1)];
     dispatch_semaphore_t written = dispatch_semaphore_create(0);
     [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(written); }];
-    if (!SGWaitTimeout(written, 60) || writer.status != AVAssetWriterStatusCompleted) {
+    dispatch_semaphore_wait(written, DISPATCH_TIME_FOREVER);
+    if (writer.status != AVAssetWriterStatusCompleted) {
         [NSFileManager.defaultManager removeItemAtURL:partial error:nil];
         return NO;
     }
