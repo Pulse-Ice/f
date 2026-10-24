@@ -120,7 +120,9 @@ static NSString *const labels[] = {
     @"Ad services", @"Upsell services", @"Popups", @"Page components", @"Feed sections", @"Requests", @"Config rewrites",
 };
 static NSMutableDictionary<NSString *, NSNumber *> *sg_counts;
-static BOOL sg_unsaved;   // checks counted since the counts were last written
+static BOOL sg_dirty;             // in-memory counts are newer than what is stored
+static BOOL sg_flushScheduled;    // a background write is already queued
+static BOOL sg_removeStored;      // the next flush removes the stored counts instead
 
 static NSString *checkedKey(NSString *label) {
     return [label stringByAppendingString:@" checked"];
@@ -131,6 +133,43 @@ static BOOL countsChecks(NSString *label) {
     return [@[@"Popups", @"Page components", @"Feed sections", @"Requests", @"Config rewrites"] containsObject:label];
 }
 
+static dispatch_queue_t flushQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("spotifyglass.adblock.flush", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+// The stored counts are only ever touched here, off whatever thread counted: a stall in the
+// preferences daemon then parks this queue alone, never the app (LiveContainer guests).
+static void flushAsync(void) {
+    dispatch_async(flushQueue(), ^{
+        NSDictionary *snapshot = nil;
+        BOOL remove = NO;
+        @synchronized (kCounts) {
+            sg_flushScheduled = NO;
+            if (!sg_dirty || !sg_counts) return;
+            remove = sg_removeStored;
+            sg_removeStored = NO;
+            snapshot = remove ? nil : [sg_counts copy];
+            sg_dirty = NO;
+        }
+        if (remove) [NSUserDefaults.standardUserDefaults removeObjectForKey:kCounts];
+        else if (snapshot) [NSUserDefaults.standardUserDefaults setObject:snapshot forKey:kCounts];
+    });
+}
+
+// Called with the kCounts lock held. Coalesces bursts (launch fires dozens) into one write.
+static void noteDirtyLocked(void) {
+    sg_dirty = YES;
+    if (!sg_flushScheduled) {
+        sg_flushScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), flushQueue(), ^{
+            flushAsync();
+        });
+    }
+}
+
 // Counting happens on whichever thread the hook ran on, the page reads on the main one.
 static NSMutableDictionary<NSString *, NSNumber *> *countsLocked(void) {
     if (!sg_counts) {
@@ -139,7 +178,7 @@ static NSMutableDictionary<NSString *, NSNumber *> *countsLocked(void) {
         if (sg_counts.count && !sg_counts[checkedKey(@"Requests")]) {
             [sg_counts removeAllObjects];
             sg_counts[checkedKey(@"Requests")] = @0;
-            [NSUserDefaults.standardUserDefaults setObject:sg_counts forKey:kCounts];
+            sg_dirty = YES;
         }
     }
     return sg_counts;
@@ -149,8 +188,7 @@ void SGAdBlockCountOne(NSString *label) {
     @synchronized (kCounts) {
         NSMutableDictionary<NSString *, NSNumber *> *counts = countsLocked();
         counts[label] = @(counts[label].unsignedIntegerValue + 1);
-        [NSUserDefaults.standardUserDefaults setObject:counts forKey:kCounts];
-        sg_unsaved = NO;
+        noteDirtyLocked();
     }
 }
 
@@ -159,7 +197,7 @@ void SGAdBlockSawOne(NSString *label) {
         NSMutableDictionary<NSString *, NSNumber *> *counts = countsLocked();
         NSString *key = checkedKey(label);
         counts[key] = @(counts[key].unsignedIntegerValue + 1);
-        sg_unsaved = YES;
+        noteDirtyLocked();
     }
 }
 
@@ -169,15 +207,11 @@ NSUInteger SGAdBlockChecked(NSString *label) {
     }
 }
 
-// The checks counted since the last stop, written as Spotify leaves the screen.
+// The counts so far, written as Spotify leaves the screen.
 __attribute__((constructor)) static void saveChecksOnLeaving(void) {
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil
                                                 usingBlock:^(NSNotification *note) {
-        @synchronized (kCounts) {
-            if (!sg_unsaved) return;
-            [NSUserDefaults.standardUserDefaults setObject:countsLocked() forKey:kCounts];
-            sg_unsaved = NO;
-        }
+        flushAsync();
     }];
 }
 
@@ -198,7 +232,7 @@ NSUInteger SGAdBlockCount(NSString *label) {
 void SGResetAdBlock(void) {
     @synchronized (kCounts) {
         sg_counts = [NSMutableDictionary dictionary];
-        sg_unsaved = NO;
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:kCounts];
+        sg_removeStored = YES;
+        noteDirtyLocked();
     }
 }
