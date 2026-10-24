@@ -22,6 +22,8 @@ static const size_t kRuleCount = sizeof(kRules) / sizeof(kRules[0]);
 
 static NSString *const kCounts = @"spotifyglass.privacy.counts";
 static NSMutableDictionary<NSString *, NSNumber *> *sg_counts;
+static BOOL sg_dirty;             // in-memory counts are newer than what is stored
+static BOOL sg_flushScheduled;    // a background write is already queued
 
 @interface SGBlockProtocol : NSURLProtocol
 @end
@@ -33,15 +35,49 @@ static NSMutableDictionary<NSString *, NSNumber *> *countsLocked(void) {
         for (NSString *label in sg_counts.allKeys) {
             if (![current containsObject:label]) sg_counts[label] = nil;
         }
+        if (sg_counts.count) sg_dirty = YES; // pruned entries are dropped on the next flush
     }
     return sg_counts;
+}
+
+static dispatch_queue_t flushQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ queue = dispatch_queue_create("spotifyglass.privacy.flush", DISPATCH_QUEUE_SERIAL); });
+    return queue;
+}
+
+// The stored counts are only ever touched here, off whatever thread counted: a stall in the
+// preferences daemon then parks this queue alone, never the app (LiveContainer guests).
+static void flushAsync(void) {
+    dispatch_async(flushQueue(), ^{
+        NSDictionary *snapshot = nil;
+        @synchronized (SGBlockProtocol.class) {
+            sg_flushScheduled = NO;
+            if (!sg_dirty || !sg_counts) return;
+            snapshot = [sg_counts copy];
+            sg_dirty = NO;
+        }
+        if (snapshot) [NSUserDefaults.standardUserDefaults setObject:snapshot forKey:kCounts];
+    });
+}
+
+// Called with the counts lock held. Coalesces bursts into one write.
+static void noteDirtyLocked(void) {
+    sg_dirty = YES;
+    if (!sg_flushScheduled) {
+        sg_flushScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), flushQueue(), ^{
+            flushAsync();
+        });
+    }
 }
 
 static void countOne(NSString *label) {
     @synchronized (SGBlockProtocol.class) {
         NSMutableDictionary<NSString *, NSNumber *> *counts = countsLocked();
         counts[label] = @(counts[label].unsignedIntegerValue + 1);
-        [NSUserDefaults.standardUserDefaults setObject:counts forKey:kCounts];
+        noteDirtyLocked();
     }
 }
 
@@ -80,7 +116,8 @@ NSUInteger SGBlockedCount(NSString *label) {
 void SGResetBlocked(void) {
     @synchronized (SGBlockProtocol.class) {
         sg_counts = [NSMutableDictionary dictionary];
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:kCounts];
+        sg_dirty = YES;
+        noteDirtyLocked();
     }
 }
 
